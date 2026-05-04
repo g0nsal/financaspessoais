@@ -1,14 +1,12 @@
 import streamlit as st
 import pandas as pd
 import google.generativeai as genai
-import plotly.express as px
 import json
 import os
 
-# --- 1. CONFIGURAÇÃO E CATEGORIAS REAIS ---
-st.set_page_config(page_title="Budget Tracking S&G", layout="wide")
+st.set_page_config(page_title="S&G Data Formatter", layout="wide")
 
-# Lista exata baseada no teu Excel
+# --- CATEGORIAS ---
 MINHAS_CATEGORIAS = [
     "Cred. Hab. / Renda", "Combustível", "Roupa", "Mercearia", "Restaurantes", 
     "Água", "Prendas", "Saídas", "Netflix", "Internet", "Cabeleireiro", 
@@ -19,118 +17,93 @@ MINHAS_CATEGORIAS = [
     "Portagens", "Gás", "Eletricidade", "Limpeza", "Salário", "Outros"
 ]
 
-MEMORY_FILE = "memoria_categorias.json"
+# --- REGRAS DO TEU EXCEL ---
+def aplicar_regras_excel(desc):
+    d = str(desc).upper()
+    if any(x in d for x in ["VIAVERDE", "VIA VERDE", "A21", "A8", "A1", "A9"]): return "Portagens"
+    if any(x in d for x in ["CONTINENTE", "LIDL", "PINGO", "MINIPRECO", "ALDI"]): return "Mercearia"
+    if any(x in d for x in ["FARMACIA", "WELLS", "FARMA"]): return "Farmácia"
+    if "SMAS" in d: return "Água"
+    if "PRESTACAO" in d: return "Cred. Hab. / Renda"
+    if "VALOR ACTIVO" in d: return "Condomínio"
+    if "LIGAT" in d: return "Internet"
+    if "LUZBOA" in d: return "Eletricidade"
+    if "LISBOAGAS" in d: return "Gás"
+    if "WOO" in d: return "Telemóveis"
+    if any(x in d for x in ["IKEA", "CHINA"]): return "Decoração/Obras"
+    if any(x in d for x in ["MULTICARE", "CUF"]): return "Despesas Médicas"
+    return None
 
-def carregar_memoria():
-    if os.path.exists(MEMORY_FILE):
-        try:
-            with open(MEMORY_FILE, "r") as f: return json.load(f)
-        except: return {"Dicionario": {}}
-    return {"Dicionario": {}}
-
-def guardar_memoria(memoria):
-    with open(MEMORY_FILE, "w") as f: json.dump(memoria, f)
-
-def sugerir_categoria_ia(descricao):
+def sugerir_ia(desc):
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        prompt = f"""
-        Categoriza este movimento bancário: '{descricao}'
-        Usa uma destas categorias: {MINHAS_CATEGORIAS}
-        Regras: 'PAG.PRESTACAO' ou 'EMPR' -> 'Cred. Hab. / Renda'. 'PINGO DOCE' ou 'CONTINENTE' -> 'Mercearia'.
-        Responde apenas a palavra exata.
-        """
-        response = model.generate_content(prompt)
-        sugestao = response.text.strip()
-        return sugestao if sugestao in MINHAS_CATEGORIAS else "Outros"
+        prompt = f"Categoriza apenas com uma palavra: '{desc}'. Opções: {MINHAS_CATEGORIAS}"
+        return model.generate_content(prompt).text.strip()
     except: return "Outros"
 
-# --- 2. INTERFACE ---
-st.title("📊 Budget Tracking S&G")
+# --- INTERFACE ---
+st.title("📑 Formatador para Excel S&G")
+st.info("Faz o upload do extrato e copia os dados somados por categoria para o teu Excel.")
 
-dados_memoria = carregar_memoria()
-if "Dicionario" not in dados_memoria: dados_memoria["Dicionario"] = {}
-
-uploaded_file = st.file_uploader("Upload do Extrato Excel", type="xlsx")
+uploaded_file = st.file_uploader("Upload Excel ActivoBank / Cetelem", type="xlsx")
 
 if uploaded_file:
     try:
-        # Encontrar cabeçalho
+        # Lógica de leitura robusta
         df_all = pd.read_excel(uploaded_file, header=None)
         header_idx = 0
         for i, row in df_all.iterrows():
-            row_str = " ".join([str(x).lower() for x in row if pd.notnull(x)])
-            if 'descri' in row_str or 'movimento' in row_str:
+            if any('descri' in str(x).lower() for x in row):
                 header_idx = i
                 break
         
-        df_orig = pd.read_excel(uploaded_file, header=header_idx)
-        df_orig = df_orig.loc[:, ~df_orig.columns.str.contains('^Unnamed')]
+        df = pd.read_excel(uploaded_file, header=header_idx)
         
-        # Mapeamento robusto
-        temp_df = pd.DataFrame()
-        for col in df_orig.columns:
-            c_low = str(col).lower()
-            if 'data' in c_low and 'valor' not in c_low and 'Data' not in temp_df.columns:
-                temp_df['Data'] = df_orig[col]
-            elif ('desc' in c_low or 'hist' in c_low) and 'Descricao' not in temp_df.columns:
-                temp_df['Descricao'] = df_orig[col]
-            elif any(x in c_low for x in ['valor', 'import', 'montante']) and 'Data' not in c_low and 'Valor' not in temp_df.columns:
-                temp_df['Valor'] = df_orig[col]
+        # Identificar colunas
+        cols = {'Data': None, 'Desc': None, 'Valor': None}
+        for c in df.columns:
+            cl = str(c).lower()
+            if 'data' in cl and not cols['Data']: cols['Data'] = c
+            if ('desc' in cl or 'hist' in cl) and not cols['Desc']: cols['Desc'] = c
+            if any(x in cl for x in ['valor', 'import', 'montant']) and not cols['Valor']: cols['Valor'] = c
 
-        # Fallback se não detectar
-        if len(temp_df.columns) < 3:
-            temp_df = df_orig.iloc[:, [0, 1, 2]]
-            temp_df.columns = ['Data', 'Descricao', 'Valor']
-
-        df = temp_df.dropna(subset=['Descricao', 'Valor']).copy()
+        df = df[[cols['Data'], cols['Desc'], cols['Valor']]].copy()
+        df.columns = ['Data', 'Descricao', 'Valor']
+        df['Data'] = pd.to_datetime(df['Data'], errors='coerce')
         df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
-
-        # Categorização
-        novos = []
-        desc_unicas = df['Descricao'].unique()
-        map_sugestoes = {}
-
-        for d in desc_unicas:
-            if d in dados_memoria["Dicionario"]:
-                map_sugestoes[d] = dados_memoria["Dicionario"][d]
-            else:
-                sug = sugerir_categoria_ia(d)
-                map_sugestoes[d] = f"❓ {sug}"
-                novos.append(d)
-
-        df['Categoria'] = df['Descricao'].map(map_sugestoes)
-
-        # Painel de Ensino
-        if novos:
-            with st.expander("🎓 Validar Movimentos Novos", expanded=True):
-                for i, item in enumerate(novos[:15]):
-                    c1, c2, c3 = st.columns([3, 2, 1])
-                    sug_limpa = map_sugestoes[item].replace("❓ ", "")
-                    idx = MINHAS_CATEGORIAS.index(sug_limpa) if sug_limpa in MINHAS_CATEGORIAS else 0
-                    c1.write(f"**{item}**")
-                    escolha = c2.selectbox(f"Cat_{i}", MINHAS_CATEGORIAS, index=idx, key=f"sel_{i}", label_visibility="collapsed")
-                    if c3.button("✓", key=f"btn_{i}"):
-                        dados_memoria["Dicionario"][item] = escolha
-                        guardar_memoria(dados_memoria)
-                        st.rerun()
-
-        # DASHBOARD
-        st.divider()
-        gastos = df[df['Valor'] < 0]
-        col_a, col_b, col_c = st.columns(3)
-        col_a.metric("Despesas", f"{abs(gastos['Valor'].sum()):.2f}€")
-        col_b.metric("Receitas", f"{df[df['Valor'] > 0]['Valor'].sum():.2f}€")
-        col_c.metric("Saldo", f"{df['Valor'].sum():.2f}€")
-
-        df_p = df.copy()
-        df_p['Categoria'] = df_p['Categoria'].str.replace("❓ ", "")
-        gastos_cat = df_p[df_p['Valor'] < 0].groupby('Categoria')['Valor'].sum().abs().reset_index().sort_values('Valor')
         
-        fig = px.bar(gastos_cat, x='Valor', y='Categoria', orientation='h', title="Gastos por Categoria")
-        st.plotly_chart(fig, use_container_width=True)
-        st.dataframe(df, use_container_width=True)
+        # Categorização
+        categorias_atribuidas = []
+        for d in df['Descricao']:
+            regra = aplicar_regras_excel(d)
+            categorias_atribuidas.append(regra if regra else sugerir_ia(d))
+        
+        df['Categoria'] = categorias_atribuidas
+        
+        # --- PROCESSAMENTO PARA COPIAR E COLAR ---
+        # 1. Filtrar apenas despesas (Valor < 0)
+        despesas = df[df['Valor'] < 0].copy()
+        despesas['Valor'] = despesas['Valor'].abs()
+        
+        # 2. Agrupar por Mês e Categoria
+        despesas['Mes_Ano'] = despesas['Data'].dt.strftime('%Y-%m')
+        resumo = despesas.groupby(['Mes_Ano', 'Categoria'])['Valor'].sum().reset_index()
+        
+        # 3. Formatar string para o Excel (Data | Descrição fixa | Valor | Categoria)
+        # Ex: 01-01-2024 | Total Mercearia | 250.50 | Mercearia
+        output_rows = []
+        for _, row in resumo.iterrows():
+            data_fake = f"01-{row['Mes_Ano'][5:7]}-{row['Mes_Ano'][0:4]}" # Ex: 01-01-2024
+            linha = f"{data_fake}\tTotal {row['Categoria']}\t{row['Valor']:.2f}\t{row['Categoria']}"
+            output_rows.append(linha)
+
+        st.subheader("📋 Dados para Copiar (Paste no Excel S&G)")
+        text_output = "\n".join(output_rows)
+        st.text_area("Copia o conteúdo abaixo:", value=text_output, height=300)
+        
+        st.success("Dica: Os valores estão separados por TAB, o que permite colar direto nas colunas do Excel.")
+        st.dataframe(resumo)
 
     except Exception as e:
-        st.error(f"Erro no processamento: {e}")
+        st.error(f"Erro: {e}")
