@@ -16,7 +16,7 @@ def carregar_memoria():
             with open(MEMORY_FILE, "r") as f: return json.load(f)
         except: return {}
     return {
-        "Categorias": ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"], 
+        "Categorias": ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Seguros", "Outros"], 
         "Dicionario": {}
     }
 
@@ -27,13 +27,10 @@ def sugerir_categoria_ia(descricao, categorias_disponiveis):
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        prompt = f"Categoriza este gasto bancário em Portugal: '{descricao}'. As categorias permitidas são: {categorias_disponiveis}. Responde apenas com a palavra exata da categoria que melhor se aplica."
+        prompt = f"Categoriza este gasto bancário em Portugal: '{descricao}'. Categorias permitidas: {categorias_disponiveis}. Responde apenas com a palavra exata."
         response = model.generate_content(prompt)
         sugestao = response.text.strip()
-        # Garantir que a IA não inventa categorias fora da lista
-        if sugestao in categorias_disponiveis:
-            return sugestao
-        return "Outros"
+        return sugestao if sugestao in categorias_disponiveis else "Outros"
     except:
         return "Outros"
 
@@ -45,113 +42,110 @@ def ler_excel_inteligente(file):
         if 'descrição' in row_str or 'descritivo' in row_str:
             header_row = i
             break
+    # Lê os dados a partir da linha detetada
     df = pd.read_excel(file, header=header_row)
-    # Resolver colunas duplicadas (ex: duas colunas 'Data')
-    cols = []
-    count = {}
-    for column in df.columns:
-        if column not in count:
-            cols.append(column)
-            count[column] = 1
+    
+    # Limpeza de colunas duplicadas de forma robusta
+    new_cols = []
+    for i, col in enumerate(df.columns):
+        col_name = str(col).strip()
+        if col_name in new_cols or not col_name:
+            new_cols.append(f"{col_name}_{i}")
         else:
-            cols.append(f"{column}_{count[column]}")
-            count[column] += 1
-    df.columns = cols
+            new_cols.append(col_name)
+    df.columns = new_cols
     return df
 
 # --- INTERFACE ---
-st.title("🏦 Controlo Financeiro - Memória Inteligente")
+st.title("🏦 Controlo Financeiro Familiar")
 
 dados_memoria = carregar_memoria()
-# Garantir estrutura mínima
-if "Categorias" not in dados_memoria: dados_memoria["Categorias"] = ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"]
+if "Categorias" not in dados_memoria: dados_memoria["Categorias"] = ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Seguros", "Outros"]
 if "Dicionario" not in dados_memoria: dados_memoria["Dicionario"] = {}
 
-uploaded_file = st.file_uploader("Carrega o teu Excel (.xlsx)", type="xlsx")
+uploaded_file = st.file_uploader("Upload do Excel", type="xlsx")
 
 if uploaded_file:
     try:
-        df_limpo = ler_excel_inteligente(uploaded_file)
+        df_full = ler_excel_inteligente(uploaded_file)
         
-        mapping = {}
-        for c in df_limpo.columns:
-            c_low = str(c).lower()
-            if 'data mov' in c_low or ('data' in c_low and 'valor' not in c_low and 'data' not in mapping.values()): mapping[c] = 'Data'
-            elif 'desc' in c_low: mapping[c] = 'Descricao'
-            elif any(x in c_low for x in ['valor', 'importância', 'montante']): mapping[c] = 'Valor'
+        # Identificar colunas por conteúdo (evita erro de nomes)
+        col_data, col_desc, col_valor = None, None, None
         
-        df = df_limpo.rename(columns=mapping)
-        # Manter apenas o essencial para evitar erros de colunas duplicadas
-        df = df[['Data', 'Descricao', 'Valor']].copy()
-        df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
+        for c in df_full.columns:
+            c_low = c.lower()
+            if 'data mov' in c_low and not col_data: col_data = c
+            elif 'data' in c_low and 'valor' not in c_low and not col_data: col_data = c
+            elif ('desc' in c_low or 'histórico' in c_low) and not col_desc: col_desc = c
+            elif any(x in c_low for x in ['valor', 'importância', 'montante']) and 'data' not in c_low and not col_valor: col_valor = c
 
-        # --- PROCESSAMENTO DE CATEGORIAS ---
-        categorias_finais = []
-        novos_itens = []
+        if not col_desc or not col_valor:
+            st.error(f"Não detetei as colunas. Encontradas: Desc={col_desc}, Valor={col_valor}")
+            st.write("Colunas disponíveis:", list(df_full.columns))
+        else:
+            # Criar DataFrame de trabalho limpo
+            df = df_full[[col_data or df_full.columns[0], col_desc, col_valor]].copy()
+            df.columns = ['Data', 'Descricao', 'Valor']
+            
+            df = df.dropna(subset=['Descricao', 'Valor'])
+            df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
 
-        for desc in df['Descricao']:
-            if desc in dados_memoria["Dicionario"]:
-                categorias_finais.append(dados_memoria["Dicionario"][desc])
-            else:
-                sugestao = sugerir_categoria_ia(desc, dados_memoria["Categorias"])
-                categorias_finais.append(f"❓ {sugestao}")
-                if desc not in novos_itens: novos_itens.append(desc)
-        
-        df['Categoria'] = categorias_finais
+            # --- PROCESSAMENTO ---
+            categorias_finais = []
+            novos_itens = []
+            
+            # Usar set para descrições únicas para poupar API
+            descricoes_unicas = df['Descricao'].unique()
+            map_temp = {}
 
-        # --- PAINEL DE ENSINO E CORREÇÃO ---
-        if novos_itens:
-            with st.expander("🎓 Movimentos Novos (Validar ou Corrigir)", expanded=True):
-                st.write("A IA sugeriu estas categorias. Podes alterar antes de confirmar.")
-                
-                # Opção para criar nova categoria
-                col_n1, col_n2 = st.columns([3, 1])
-                nova_cat = col_n1.text_input("Criar nova categoria (ex: Seguros, Animais):")
-                if col_n2.button("Adicionar"):
-                    if nova_cat and nova_cat not in dados_memoria["Categorias"]:
-                        dados_memoria["Categorias"].append(nova_cat)
-                        guardar_memoria(dados_memoria)
-                        st.rerun()
+            for desc in descricoes_unicas:
+                if desc in dados_memoria["Dicionario"]:
+                    map_temp[desc] = dados_memoria["Dicionario"][desc]
+                else:
+                    sugestao = sugerir_categoria_ia(desc, dados_memoria["Categorias"])
+                    map_temp[desc] = f"❓ {sugestao}"
+                    novos_itens.append(desc)
 
-                st.divider()
+            df['Categoria'] = df['Descricao'].map(map_temp)
 
-                # Lista de novos movimentos para validar
-                for i, item in enumerate(novos_itens[:15]): # Lote de 15 para performance
-                    c1, c2, c3 = st.columns([3, 2, 1])
-                    
-                    sugestao_ia = df[df['Descricao'] == item]['Categoria'].iloc[0].replace("❓ ", "")
-                    
-                    # Se a categoria sugerida não existir (erro da IA), usa 'Outros'
-                    lista_cats = dados_memoria["Categorias"]
-                    default_idx = lista_cats.index(sugestao_ia) if sugestao_ia in lista_cats else lista_cats.index("Outros")
-                    
-                    c1.markdown(f"**{item}**")
-                    escolha = c2.selectbox(f"Validar categoria para {i}", lista_cats, index=default_idx, key=f"sel_{i}", label_visibility="collapsed")
-                    
-                    if c3.button("✓", key=f"btn_{i}"):
-                        dados_memoria["Dicionario"][item] = escolha
-                        guardar_memoria(dados_memoria)
-                        st.rerun()
+            # --- PAINEL DE ENSINO ---
+            if novos_itens:
+                with st.expander("🎓 Validar Novas Categorias", expanded=True):
+                    # Adicionar Categoria
+                    c_n1, c_n2 = st.columns([3,1])
+                    nova = c_n1.text_input("Nova Categoria:")
+                    if c_n2.button("Adicionar") and nova:
+                        if nova not in dados_memoria["Categorias"]:
+                            dados_memoria["Categorias"].append(nova)
+                            guardar_memoria(dados_memoria)
+                            st.rerun()
 
-        # --- DASHBOARD ---
-        st.divider()
-        despesas = df[df['Valor'] < 0]
-        
-        col_m1, col_m2, col_m3 = st.columns(3)
-        col_m1.metric("Total Gastos", f"{abs(despesas['Valor'].sum()):.2f}€")
-        col_m2.metric("Total Entradas", f"{df[df['Valor'] > 0]['Valor'].sum():.2f}€")
-        col_m3.metric("Saldo do Mês", f"{df['Valor'].sum():.2f}€")
+                    st.divider()
+                    for i, item in enumerate(novos_itens[:10]):
+                        col_a, col_b, col_c = st.columns([3, 2, 1])
+                        sug_ia = map_temp[item].replace("❓ ", "")
+                        
+                        lista = dados_memoria["Categorias"]
+                        d_idx = lista.index(sug_ia) if sug_ia in lista else 0
+                        
+                        col_a.write(f"**{item}**")
+                        escolha = col_b.selectbox("Cat", lista, index=d_idx, key=f"s_{i}", label_visibility="collapsed")
+                        if col_c.button("✓", key=f"b_{i}"):
+                            dados_memoria["Dicionario"][item] = escolha
+                            guardar_memoria(dados_memoria)
+                            st.rerun()
 
-        # Gráfico e Tabela
-        tab1, tab2 = st.tabs(["📊 Distribuição", "📝 Lista Completa"])
-        
-        with tab1:
+            # --- DASHBOARD ---
+            st.divider()
+            despesas = df[df['Valor'] < 0]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Gastos", f"{abs(despesas['Valor'].sum()):.2f}€")
+            c2.metric("Entradas", f"{df[df['Valor'] > 0]['Valor'].sum():.2f}€")
+            c3.metric("Saldo", f"{df['Valor'].sum():.2f}€")
+
             df_plot = df.copy()
             df_plot['Categoria'] = df_plot['Categoria'].str.replace("❓ ", "")
-            fig = px.pie(df_plot[df_plot['Valor'] < 0], values=df_plot[df_plot['Valor'] < 0]['Valor'].abs(), names='Categoria', hole=0.5)
-            st.plotly_chart(fig, use_container_width=True)
-            
-        with tab2:
+            st.plotly_chart(px.pie(df_plot[df_plot['Valor'] < 0], values=df_plot[df_plot['Valor'] < 0]['Valor'].abs(), names='Categoria', hole=0.5))
             st.dataframe(df, use_container_width=True)
 
     except Exception as e:
