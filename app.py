@@ -1,108 +1,106 @@
 import streamlit as st
 import pandas as pd
 import google.generativeai as genai
-import io
+import plotly.express as px
+import json
 
 # --- CONFIGURAÇÃO ---
-st.set_page_config(page_title="Gestão Financeira Familiar", layout="wide")
-genai.configure(api_key="TUA_CHAVE_API_AQUI")
-model = genai.GenerativeModel('gemini-1.5-flash')
+st.set_page_config(page_title="Gestão Financeira Gonsalo", layout="wide")
 
-# --- ESTILO ---
-st.markdown("""
-    <style>
-    .main { background-color: #0e1117; }
-    .stMetric { background-color: #161b22; padding: 15px; border-radius: 10px; border: 1px solid #30363d; }
-    </style>
-""", unsafe_allow_html=True)
+# Inicializar Estado
+if 'data' not in st.session_state:
+    st.session_state['data'] = None
 
-# --- LÓGICA DE IA ---
-def categorizar_transacoes(df):
-    """Envia as descrições para o Gemini categorizar."""
-    lista_descricoes = df['Descrição'].unique().tolist()
-    
-    prompt = f"""
-    Atua como um contabilista português. Categoriza estas descrições de movimentos bancários:
-    {lista_descricoes}
-    
-    Categorias permitidas: [Alimentação, Habitação, Transportes, Saúde, Lazer, Estado, Investimentos, Salário, Transferências, Outros].
-    
-    Regras:
-    - SMAS, EPAL, Goldenergy, Condomínio -> Habitação.
-    - Pingo Doce, Continente, Lidl, Mercadona -> Alimentação.
-    - Galp, Repsol, Via Verde -> Transportes.
-    - Transferências entre Sofia e Gonçalo -> Transferências.
-    
-    Responde APENAS com um formato de lista Python: ["Categoria1", "Categoria2", ...] na mesma ordem.
-    """
-    
-    response = model.generate_content(prompt)
+# --- FUNÇÃO DE CATEGORIZAÇÃO (IA) ---
+def categorizar_com_ia(lista_descricoes):
     try:
-        # Converte a string da resposta numa lista
-        categorias = eval(response.text.strip())
-        mapping = dict(zip(lista_descricoes, categorias))
-        return mapping
-    except:
-        st.error("Erro na resposta da IA. Tenta novamente.")
+        api_key = st.secrets["GEMINI_API_KEY"]
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        
+        # Filtro para não enviar descrições vazias
+        lista_limpa = [str(d) for d in lista_descricoes if str(d).strip()]
+        if not lista_limpa:
+            return {}
+
+        prompt = f"""
+        Categoriza estes movimentos bancários portugueses nestas categorias: 
+        [Alimentação, Habitação, Transportes, Saúde, Lazer, Estado, Investimentos, Salário, Transferências, Outros].
+        
+        Movimentos: {lista_limpa}
+        
+        Responde APENAS no formato JSON: {{"Descricao": "Categoria", ...}}
+        """
+        
+        response = model.generate_content(prompt)
+        # Limpeza para extrair apenas o JSON
+        texto = response.text.replace('```json', '').replace('```', '').strip()
+        return json.loads(texto)
+    except Exception as e:
+        st.error(f"Erro na IA: {e}")
         return {}
 
-# --- UI ---
-st.title("🏦 Dashboard de Despesas Familiares")
-st.subheader("Upload de Extratos (ActivoBank / Cetelem)")
+# --- INTERFACE ---
+st.title("🏦 Gestão Financeira Familiar")
 
-with st.expander("📁 Upload de Ficheiros", expanded=True):
-    uploaded_files = st.file_uploader("Carrega os teus Excels ou CSVs", accept_multiple_files=True)
+uploaded_file = st.file_uploader("Upload do Excel (ActivoBank ou Cetelem)", type="xlsx")
 
-if uploaded_files:
-    all_data = []
-    for file in uploaded_files:
-        # Tenta ler Excel (padrão ActivoBank/Cetelem)
-        try:
-            # O ActivoBank costuma ter lixo nas primeiras 7 linhas
-            df = pd.read_excel(file, header=7) 
-            if 'Descrição' not in df.columns:
-                df = pd.read_excel(file) # Tenta sem skip se falhar
-        except:
-            df = pd.read_csv(file)
-            
-        all_data.append(df)
+if uploaded_file:
+    try:
+        # Tenta ler ActivoBank (pula 7 linhas)
+        df_raw = pd.read_excel(uploaded_file)
+        if "Descrição" not in df_raw.columns:
+            df_raw = pd.read_excel(uploaded_file, header=7)
 
-    if all_data:
-        df_final = pd.concat(all_data, ignore_index=True)
+        # Normalizar colunas
+        df_raw.columns = [str(c).strip() for c in df_raw.columns]
         
-        # Limpeza básica (ajustar nomes de colunas conforme o teu banco)
-        # Exemplo para ActivoBank: 'Data Mov.' e 'Descrição' e 'Montante'
-        st.write(f"Total de movimentos carregados: {len(df_final)}")
+        mapping_cols = {
+            'Descrição': 'Descricao',
+            'Descritivo': 'Descricao',
+            'Importância': 'Valor',
+            'Montante': 'Valor',
+            'Valor': 'Valor',
+            'Data Mov.': 'Data',
+            'Data': 'Data'
+        }
+        df = df_raw.rename(columns=mapping_cols)
+        
+        # Manter apenas o que interessa
+        cols_existentes = [c for c in ['Data', 'Descricao', 'Valor'] if c in df.columns]
+        df = df[cols_existentes].dropna(subset=['Descricao', 'Valor'])
+        df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce')
 
+        st.success(f"Carregados {len(df)} movimentos.")
+        
         if st.button("✨ Categorizar com IA"):
-            with st.spinner("O Gemini está a analisar os teus gastos..."):
-                mapping = categorizar_transacoes(df_final)
-                df_final['Categoria'] = df_final['Descrição'].map(mapping)
-                
-                # Guardar em cache/estado para não gastar API em cada clique
-                st.session_state['df_analisado'] = df_final
+            with st.spinner("O Gemini está a analisar..."):
+                unique_desc = df['Descricao'].unique().tolist()
+                categorias_map = categorizar_com_ia(unique_desc)
+                df['Categoria'] = df['Descricao'].map(categorias_map).fillna("Outros")
+                st.session_state['data'] = df
 
-        if 'df_analisado' in st.session_state:
-            df_plot = st.session_state['df_analisado']
+        if st.session_state['data'] is not None:
+            data = st.session_state['data']
             
-            # --- DASHBOARD ---
-            c1, c2, c3 = st.columns(3)
-            receitas = df_plot[df_plot['Montante'] > 0]['Montante'].sum()
-            despesas = df_plot[df_plot['Montante'] < 0]['Montante'].sum()
+            # Dashboard
+            m1, m2, m3 = st.columns(3)
+            receitas = data[data['Valor'] > 0]['Valor'].sum()
+            despesas = data[data['Valor'] < 0]['Valor'].sum()
             
-            c1.metric("Recebimentos", f"{receitas:,.2f}€")
-            c2.metric("Gastos Totais", f"{abs(despesas):,.2f}€", delta_color="inverse")
-            c3.metric("Saldo", f"{(receitas + despesas):,.2f}€")
+            m1.metric("Recebimentos", f"{receitas:.2f}€")
+            m2.metric("Despesas", f"{abs(despesas):.2f}€")
+            m3.metric("Saldo", f"{(receitas+despesas):.2f}€")
 
-            # Gráficos
             st.markdown("---")
-            col_chart1, col_chart2 = st.columns(2)
+            c1, c2 = st.columns(2)
             
-            with col_chart1:
-                st.write("### Gastos por Categoria")
-                gastos_cat = df_plot[df_plot['Montante'] < 0].groupby('Categoria')['Montante'].sum().abs()
-                st.bar_chart(gastos_cat)
+            with c1:
+                fig = px.pie(data[data['Valor'] < 0], values=data[data['Valor'] < 0]['Valor'].abs(), names='Categoria', hole=0.4, title="Distribuição de Gastos")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with c2:
+                st.dataframe(data, use_container_width=True)
 
-            with col_chart2:
-                st.write("### Tabela de Detalhe")
-                st.dataframe(df_plot[['Data Mov.', 'Descrição', 'Categoria', 'Montante']], use_container_width=True)
+    except Exception as e:
+        st.error(f"Erro ao ler ficheiro: {e}")
