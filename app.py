@@ -30,63 +30,55 @@ def sugerir_categoria_ia(descricao):
     except:
         return "Outros"
 
-# --- PROCESSO DE LIMPEZA ROBUSTO ---
-def processar_extrato(file):
-    # 1. Ler tudo para encontrar o cabeçalho real
+# --- FUNÇÃO DETETIVE DE EXCEL ---
+def ler_excel_inteligente(file):
+    # Carrega o excel sem header para analisar a estrutura
     df_raw = pd.read_excel(file, header=None)
     
+    # Procura a linha que contém as palavras-chave do ActivoBank ou Cetelem
     header_row = 0
     for i, row in df_raw.iterrows():
-        row_str = " ".join([str(val).lower() for val in row.values if pd.notnull(val)])
-        if 'descrição' in row_str or 'descritivo' in row_str or 'movimento' in row_str:
+        row_str = " ".join([str(val).lower() for val in row.values])
+        if 'descrição' in row_str or 'descritivo' in row_str:
             header_row = i
             break
             
-    # 2. Re-ler com o cabeçalho correto
+    # Re-lê o ficheiro a partir da linha encontrada
     df = pd.read_excel(file, header=header_row)
-    
-    # 3. Eliminar colunas "Unnamed" (lixo de formatação do Excel)
-    df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
-    
-    # 4. Mapear colunas essenciais
-    mapping = {}
-    for c in df.columns:
-        c_low = str(c).lower()
-        if 'data' in c_low and 'valor' not in c_low: mapping[c] = 'Data'
-        elif 'desc' in c_low: mapping[c] = 'Descricao'
-        elif any(x in c_low for x in ['valor', 'importância', 'montante']): mapping[c] = 'Valor'
-    
-    df = df.rename(columns=mapping)
-    
-    # 5. Filtrar linhas de ruído (Saldos, cabeçalhos repetidos, etc)
-    palavras_ruido = ['saldo anterior', 'histórico de conta', 'número de conta', 'extrato de']
-    if 'Descricao' in df.columns:
-        mask = df['Descricao'].astype(str).lower().apply(lambda x: not any(p in x for p in palavras_ruido))
-        df = df[mask]
-    
     return df
 
 # --- INTERFACE ---
-st.title("🏦 Gestão Financeira Familiar")
+st.title("🏦 Dashboard Financeiro Inteligente")
 
 memoria = carregar_memoria()
-uploaded_file = st.file_uploader("Siga com o upload do seu Excel (.xlsx)", type="xlsx")
+uploaded_file = st.file_uploader("Upload do Excel", type="xlsx")
 
 if uploaded_file:
     try:
-        df = processar_extrato(uploaded_file)
+        df_limpo = ler_excel_inteligente(uploaded_file)
         
+        # Mapeamento de Colunas
+        mapping = {}
+        for c in df_limpo.columns:
+            c_low = str(c).lower()
+            if 'data' in c_low: mapping[c] = 'Data'
+            elif 'desc' in c_low: mapping[c] = 'Descricao'
+            elif any(x in c_low for x in ['valor', 'importância', 'montante', 'movimento']): 
+                # Evitar confundir com 'Data Valor'
+                if 'data' not in c_low: mapping[c] = 'Valor'
+        
+        df = df_limpo.rename(columns=mapping)
+        
+        # Validação
         if 'Descricao' not in df.columns or 'Valor' not in df.columns:
-            st.error("Não detetei as colunas de Descrição/Valor. Tente exportar o Excel novamente.")
-            st.write("Colunas detetadas:", list(df.columns))
+            st.error(f"Ainda não consegui encontrar as colunas. Colunas lidas: {list(df.columns)}")
+            st.write("Amostra dos dados para debug:", df.head(10))
         else:
+            # Limpeza de dados
             df = df.dropna(subset=['Descricao', 'Valor'])
-            # Limpeza de valores (tratar 1.200,50 como 1200.50)
-            if df['Valor'].dtype == object:
-                df['Valor'] = df['Valor'].astype(str).str.replace('.', '').str.replace(',', '.').str.extract('([-+]?\d*\.?\d+)')[0]
             df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
-
-            # Categorização
+            
+            # --- CATEGORIZAÇÃO ---
             categorias_finais = []
             novos_itens = []
             for desc in df['Descricao']:
@@ -99,35 +91,32 @@ if uploaded_file:
             
             df['Categoria'] = categorias_finais
 
-            # UI de Ensino
+            # --- UI DE ENSINO ---
             if novos_itens:
-                with st.expander("🎓 Ensinar novas categorias", expanded=True):
+                with st.expander("🎓 Confirmar Categorias Novas", expanded=True):
                     for i, item in enumerate(novos_itens[:10]):
                         c1, c2 = st.columns([3, 1])
                         sugestao_ia = df[df['Descricao'] == item]['Categoria'].iloc[0].replace("❓ ", "")
                         escolha = c2.selectbox("Cat", ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"], 
                                             index=["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"].index(sugestao_ia) if sugestao_ia in ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"] else 9,
-                                            key=f"item_{i}")
-                        if c1.button(f"Confirmar {item}", key=f"btn_{i}"):
+                                            key=f"s_{i}")
+                        if c1.button(f"Confirmar {item}", key=f"b_{i}"):
                             memoria[item] = escolha
                             guardar_memoria(memoria)
                             st.rerun()
 
-            # Dashboard
+            # --- DASHBOARD ---
             st.divider()
             despesas = df[df['Valor'] < 0]
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Despesas", f"{abs(despesas['Valor'].sum()):.2f}€")
-            c2.metric("Receitas", f"{df[df['Valor'] > 0]['Valor'].sum():.2f}€")
-            c3.metric("Saldo", f"{df['Valor'].sum():.2f}€")
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Despesas", f"{abs(despesas['Valor'].sum()):.2f}€")
+            col2.metric("Receitas", f"{df[df['Valor'] > 0]['Valor'].sum():.2f}€")
+            col3.metric("Saldo", f"{df['Valor'].sum():.2f}€")
 
-            # Gráfico Interativo
             df_plot = df.copy()
             df_plot['Categoria'] = df_plot['Categoria'].str.replace("❓ ", "")
-            fig = px.pie(df_plot[df_plot['Valor'] < 0], values=df_plot[df_plot['Valor'] < 0]['Valor'].abs(), names='Categoria', hole=0.5)
-            st.plotly_chart(fig, use_container_width=True)
-            
-            st.dataframe(df[['Data', 'Descricao', 'Categoria', 'Valor']], use_container_width=True)
+            st.plotly_chart(px.pie(df_plot[df_plot['Valor'] < 0], values=df_plot[df_plot['Valor'] < 0]['Valor'].abs(), names='Categoria', hole=0.5))
+            st.dataframe(df, use_container_width=True)
 
     except Exception as e:
-        st.error(f"Erro ao processar ficheiro: {e}")
+        st.error(f"Erro Crítico: {e}")
