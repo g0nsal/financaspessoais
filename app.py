@@ -8,92 +8,119 @@ import os
 # --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="Gestão Financeira Gonsalo", layout="wide")
 
-# Ficheiro local para guardar o que a IA aprendeu
+# Ficheiro de Memória
 MEMORY_FILE = "memoria_categorias.json"
 
 def carregar_memoria():
     if os.path.exists(MEMORY_FILE):
-        with open(MEMORY_FILE, "r") as f: return json.load(f)
+        try:
+            with open(MEMORY_FILE, "r") as f: return json.load(f)
+        except: return {}
     return {}
 
 def guardar_memoria(memoria):
     with open(MEMORY_FILE, "w") as f: json.dump(memoria, f)
 
-# --- FUNÇÃO DE IA CORRIGIDA ---
+# --- IA COM FALLBACK ---
 def sugerir_categoria_ia(descricao):
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
-        # Usando a versão estável para evitar o erro 404
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        
-        prompt = f"Categoriza este gasto bancário em Portugal: '{descricao}'. Escolha uma: [Alimentação, Habitação, Transportes, Saúde, Lazer, Estado, Investimentos, Salário, Transferências, Outros]. Responde apenas a palavra."
-        
+        prompt = f"Categoriza este gasto em Portugal: '{descricao}'. Categorias: [Alimentação, Habitação, Transportes, Saúde, Lazer, Estado, Investimentos, Salário, Transferências, Outros]. Responde apenas a palavra."
         response = model.generate_content(prompt)
-        return response.text.strip()
+        return response.text.strip().replace("❓", "")
     except:
         return "Outros"
 
 # --- INTERFACE ---
-st.title("🏦 Dashboard Inteligente Familiar")
+st.title("🏦 Dashboard Financeiro Inteligente")
 
 memoria = carregar_memoria()
-uploaded_file = st.file_uploader("Upload Excel", type="xlsx")
+uploaded_file = st.file_uploader("Upload do Excel (ActivoBank, Cetelem, etc.)", type="xlsx")
 
 if uploaded_file:
-    df_raw = pd.read_excel(uploaded_file)
-    if "Descrição" not in df_raw.columns:
-        df_raw = pd.read_excel(uploaded_file, header=7)
-
-    # Limpeza e Padronização
-    mapping_cols = {'Descrição': 'Descricao', 'Importância': 'Valor', 'Montante': 'Valor', 'Valor': 'Valor', 'Data Mov.': 'Data'}
-    df = df_raw.rename(columns=mapping_cols)
-    df = df[['Data', 'Descricao', 'Valor']].dropna()
-    df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce')
-
-    # --- CATEGORIZAÇÃO HÍBRIDA ---
-    categorias_finais = []
-    novos_movimentos = []
-
-    for desc in df['Descricao']:
-        if desc in memoria:
-            categorias_finais.append(memoria[desc])
+    try:
+        # Tenta ler ActivoBank (header na linha 8) ou padrão
+        df_test = pd.read_excel(uploaded_file)
+        if len(df_test.columns) < 3: # Provavelmente falhou o header
+            df_raw = pd.read_excel(uploaded_file, header=7)
         else:
-            # Se não conhece, pede sugestão à IA mas marca como "Novo"
-            sugestao = sugerir_categoria_ia(desc)
-            categorias_finais.append(f"❓ {sugestao}")
-            if desc not in novos_movimentos: novos_movimentos.append(desc)
+            df_raw = df_test
 
-    df['Categoria'] = categorias_finais
+        # Mapeamento Inteligente de Colunas (Case Insensitive)
+        cols_atuais = df_raw.columns.tolist()
+        mapping = {}
+        
+        for c in cols_atuais:
+            c_low = str(c).lower()
+            if 'data' in c_low: mapping[c] = 'Data'
+            elif 'desc' in c_low: mapping[c] = 'Descricao'
+            elif any(x in c_low for x in ['valor', 'importância', 'montante']): mapping[c] = 'Valor'
+        
+        df = df_raw.rename(columns=mapping)
+        
+        # Validar se temos as colunas mínimas
+        colunas_necessarias = ['Descricao', 'Valor']
+        if not all(c in df.columns for c in colunas_necessarias):
+            st.error(f"Não encontrei colunas de Descrição ou Valor. Colunas detetadas: {cols_atuais}")
+        else:
+            # Limpeza
+            df = df.dropna(subset=['Descricao', 'Valor'])
+            df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
+            if 'Data' not in df.columns: df['Data'] = "N/D"
 
-    # --- ZONA DE ENSINO (Aprender com o Utilizador) ---
-    if novos_movimentos:
-        with st.expander("🎓 Ensinar novas categorias", expanded=True):
-            st.write("Encontrei movimentos novos. Confirma ou altera:")
-            for m in novos_movimentos[:10]: # Mostra 10 de cada vez para não sobrecarregar
-                col_a, col_b = st.columns([2,1])
-                nova_cat = col_b.selectbox(f"Categoria para: {m}", 
-                                         ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"],
-                                         key=m)
-                if col_a.button(f"Confirmar {m}"):
-                    memoria[m] = nova_cat
-                    guardar_memoria(memoria)
-                    st.rerun()
+            # --- CATEGORIZAÇÃO ---
+            categorias_finais = []
+            novos_itens = []
 
-    # --- DASHBOARD ---
-    st.markdown("---")
-    m1, m2, m3 = st.columns(3)
-    despesas = df[df['Valor'] < 0]
-    
-    m1.metric("Gastos Totais", f"{abs(despesas['Valor'].sum()):.2f}€")
-    m2.metric("Movimentos Novos", len(novos_movimentos))
-    
-    c1, c2 = st.columns(2)
-    with c1:
-        # Limpar o prefixo "❓ " para o gráfico
-        df_plot = df.copy()
-        df_plot['Categoria'] = df_plot['Categoria'].str.replace("❓ ", "")
-        fig = px.pie(df_plot[df_plot['Valor'] < 0], values=df_plot[df_plot['Valor'] < 0]['Valor'].abs(), names='Categoria', hole=0.4)
-        st.plotly_chart(fig)
-    
-    with c2:
-        st.dataframe(df)
+            for desc in df['Descricao']:
+                if desc in memoria:
+                    categorias_finais.append(memoria[desc])
+                else:
+                    sugestao = sugerir_categoria_ia(desc)
+                    categorias_finais.append(f"❓ {sugestao}")
+                    if desc not in novos_itens: novos_itens.append(desc)
+
+            df['Categoria'] = categorias_finais
+
+            # --- ENSINAR (UI) ---
+            if novos_itens:
+                with st.expander("🎓 Ensinar Novas Categorias", expanded=True):
+                    st.info(f"Encontrei {len(novos_itens)} descrições novas. Escolha a categoria correta:")
+                    for i, item in enumerate(novos_itens[:15]): # Lote de 15 por vez
+                        c1, c2 = st.columns([3, 1])
+                        sugestao_limpa = df[df['Descricao'] == item]['Categoria'].iloc[0].replace("❓ ", "")
+                        
+                        escolha = c2.selectbox(f"Categoria", 
+                                            ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"],
+                                            index=["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"].index(sugestao_limpa) if sugestao_limpa in ["Alimentação", "Habitação", "Transportes", "Saúde", "Lazer", "Estado", "Investimentos", "Salário", "Transferências", "Outros"] else 9,
+                                            key=f"sel_{i}")
+                        
+                        if c1.button(f"Confirmar: {item}", key=f"btn_{i}"):
+                            memoria[item] = escolha
+                            guardar_memoria(memoria)
+                            st.rerun()
+
+            # --- DASHBOARD ---
+            st.divider()
+            despesas = df[df['Valor'] < 0]
+            
+            col_m1, col_m2, col_m3 = st.columns(3)
+            col_m1.metric("Total Despesas", f"{abs(despesas['Valor'].sum()):.2f}€")
+            col_m2.metric("Total Receitas", f"{df[df['Valor'] > 0]['Valor'].sum():.2f}€")
+            col_m3.metric("Saldo", f"{df['Valor'].sum():.2f}€")
+
+            tab1, tab2 = st.tabs(["📊 Gráficos", "📑 Dados"])
+            
+            with tab1:
+                df_plot = df.copy()
+                df_plot['Categoria'] = df_plot['Categoria'].str.replace("❓ ", "")
+                fig = px.pie(df_plot[df_plot['Valor'] < 0], values=df_plot[df_plot['Valor'] < 0]['Valor'].abs(), 
+                            names='Categoria', hole=0.5, title="Onde gastaste dinheiro")
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with tab2:
+                st.dataframe(df, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Erro ao processar: {e}")
