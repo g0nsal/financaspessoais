@@ -4,7 +4,7 @@ import google.generativeai as genai
 
 st.set_page_config(page_title="S&G Data Formatter", layout="wide")
 
-# --- CATEGORIAS REAIS DO TEU EXCEL ---
+# --- CATEGORIAS ---
 MINHAS_CATEGORIAS = [
     "Cred. Hab. / Renda", "Combustível", "Roupa", "Mercearia", "Restaurantes", 
     "Água", "Prendas", "Saídas", "Netflix", "Internet", "Cabeleireiro", 
@@ -15,99 +15,84 @@ MINHAS_CATEGORIAS = [
     "Portagens", "Gás", "Eletricidade", "Limpeza", "Salário", "Outros"
 ]
 
-# --- REGRAS DO TEU EXCEL (VIA VERDE, PINGO, ETC) ---
-def categorizar_com_regras(desc):
+# --- REGRAS DO TEU EXCEL ---
+def aplicar_regras(desc):
     d = str(desc).upper()
-    if any(x in d for x in ["VIAVERDE", "A21", "A8", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A9", "A10"]): return "Portagens"
+    if any(x in d for x in ["VIAVERDE", "A21", "A8", "A1", "A2", "A9"]): return "Portagens"
     if any(x in d for x in ["CONTINENTE", "LIDL", "PINGO", "MINIPRECO", "ALDI"]): return "Mercearia"
     if "SMAS" in d: return "Água"
     if "PRESTACAO" in d: return "Cred. Hab. / Renda"
-    if any(x in d for x in ["MULTICARE", "CUF"]): return "Despesas Médicas"
-    if "MR PIZZA" in d: return "Restaurantes"
-    if "VALOR ACTIVO" in d: return "Condomínio"
-    if any(x in d for x in ["IKEA", "CHINA"]): return "Decoração/Obras"
     if any(x in d for x in ["FARMACIA", "WELLS", "FARMA"]): return "Farmácia"
-    if "LIGAT" in d: return "Internet"
-    if "6175" in d: return "Limpeza"
+    if any(x in d for x in ["MULTICARE", "CUF"]): return "Despesas Médicas"
     if "WOO" in d: return "Telemóveis"
-    if any(x in d for x in ["REAL VIDA", "OCIDENTAL"]): return "Seguros"
     if "LUZBOA" in d: return "Eletricidade"
     if "LISBOAGAS" in d: return "Gás"
-    if any(x in d for x in ["AUCHAN ENERGY", "SODIMAFRA", "PRIO"]): return "Combustível"
     return None
 
 def sugerir_ia(desc):
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        prompt = f"Categoriza apenas com o nome da categoria: '{desc}'. Opções: {MINHAS_CATEGORIAS}"
+        prompt = f"Categoriza apenas com uma destas palavras: {MINHAS_CATEGORIAS}. Item: '{desc}'"
         return model.generate_content(prompt).text.strip()
     except: return "Outros"
 
-st.title("📑 Formatador S&G (Somado por Categoria)")
+st.title("📑 Formatador S&G (Somado)")
 
-uploaded_file = st.file_uploader("Upload do Extrato", type="xlsx")
+uploaded_file = st.file_uploader("Upload Extrato Excel", type="xlsx")
 
 if uploaded_file:
     try:
-        # 1. Tentar encontrar a linha onde começam os dados
-        df_raw = pd.read_excel(uploaded_file, header=None)
-        header_idx = 0
-        for i, row in df_raw.iterrows():
-            row_str = " ".join([str(val).lower() for val in row if pd.notnull(val)])
-            if any(x in row_str for x in ['descri', 'hist', 'movimento']):
-                header_idx = i
+        # 1. Tentar ler o Excel de várias formas até encontrar colunas úteis
+        df = None
+        for skip in range(0, 20):
+            temp_df = pd.read_excel(uploaded_file, skiprows=skip)
+            cols_norm = [str(c).lower() for c in temp_df.columns]
+            # Se encontrar colunas que pareçam Data e Valor, é este!
+            if any('data' in c or 'mov' in c for c in cols_norm) and \
+               any('valor' in c or 'import' in c or 'montant' in c for c in cols_norm):
+                df = temp_df
                 break
         
-        df = pd.read_excel(uploaded_file, header=header_idx)
-        
-        # 2. Mapeamento Inteligente de Colunas
-        col_map = {}
-        for c in df.columns:
-            c_low = str(c).lower()
-            if ('data' in c_low or 'mov' in c_low) and 'valor' not in c_low and 'Data' not in col_map:
-                col_map['Data'] = c
-            elif ('desc' in c_low or 'hist' in c_low) and 'Desc' not in col_map:
-                col_map['Desc'] = c
-            elif any(x in c_low for x in ['valor', 'import', 'montant']) and 'Data' not in c_low:
-                col_map['Valor'] = c
+        if df is not None:
+            # 2. Mapeamento Manual Forçado
+            final_df = pd.DataFrame()
+            for c in df.columns:
+                c_low = str(c).lower()
+                if ('data' in c_low or 'mov' in c_low) and 'Data' not in final_df.columns:
+                    final_df['Data'] = df[c]
+                if ('desc' in c_low or 'hist' in c_low or 'texto' in c_low) and 'Desc' not in final_df.columns:
+                    final_df['Desc'] = df[c]
+                if any(x in c_low for x in ['valor', 'import', 'montant']) and 'Valor' not in final_df.columns:
+                    final_df['Valor'] = df[c]
 
-        # Verificar se encontramos as 3 colunas vitais
-        if all(k in col_map for k in ['Data', 'Desc', 'Valor']):
-            df = df[[col_map['Data'], col_map['Desc'], col_map['Valor']]].copy()
-            df.columns = ['Data', 'Descricao', 'Valor']
-            
-            # Limpeza de dados
-            df['Data'] = pd.to_datetime(df['Data'], errors='coerce')
-            df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
-            df = df.dropna(subset=['Data', 'Descricao'])
+            # Limpeza e Datas
+            final_df['Data'] = pd.to_datetime(final_df['Data'], errors='coerce')
+            final_df['Valor'] = pd.to_numeric(final_df['Valor'], errors='coerce').fillna(0)
+            final_df = final_df.dropna(subset=['Desc', 'Data'])
 
-            # 3. Categorização
-            df['Categoria'] = df['Descricao'].apply(lambda x: categorizar_com_regras(x) or sugerir_ia(x))
+            # 3. Categorizar e Somar
+            final_df['Cat'] = final_df['Desc'].apply(lambda x: aplicar_regras(x) or sugerir_ia(x))
             
-            # 4. Agrupar apenas despesas negativas para o resumo mensal
-            despesas = df[df['Valor'] < 0].copy()
+            # Apenas despesas (negativos) somadas por mês/categoria
+            despesas = final_df[final_df['Valor'] < 0].copy()
             despesas['Valor'] = despesas['Valor'].abs()
             despesas['MesAno'] = despesas['Data'].dt.strftime('%m-%Y')
             
-            resumo = despesas.groupby(['MesAno', 'Categoria'])['Valor'].sum().reset_index()
+            resumo = despesas.groupby(['MesAno', 'Cat'])['Valor'].sum().reset_index()
 
-            # 5. Gerar Texto para o Excel
-            output_rows = []
+            # 4. Texto para Copiar
+            output = []
             for _, row in resumo.iterrows():
-                # Formato: 01-MM-AAAA [TAB] Descrição [TAB] Valor [TAB] Categoria
-                linha = f"01-{row['MesAno']}\tTotal {row['Categoria']}\t{str(row['Valor']).replace('.', ',')}\t{row['Categoria']}"
-                output_rows.append(linha)
+                data_excel = f"01-{row['MesAno']}"
+                # Formato: DATA [TAB] DESCRIÇÃO [TAB] VALOR [TAB] CATEGORIA
+                linha = f"{data_excel}\tTotal {row['Cat']}\t{str(row['Valor']).replace('.', ',')}\t{row['Cat']}"
+                output.append(linha)
 
-            st.subheader("📋 Dados para Copiar e Colar")
-            if output_rows:
-                final_text = "\n".join(output_rows)
-                st.text_area("Seleciona tudo (Ctrl+A), copia (Ctrl+C) e cola no Excel S&G:", value=final_text, height=300)
-                st.dataframe(resumo)
-            else:
-                st.warning("Não encontrei despesas negativas. O teu banco usa uma coluna separada para débitos?")
+            st.text_area("Copia estas linhas para o teu Excel:", value="\n".join(output), height=300)
+            st.dataframe(resumo)
         else:
-            st.error(f"Não consegui identificar as colunas. Encontradas: {list(col_map.keys())}")
+            st.error("Não consegui encontrar as colunas de Data e Valor. O ficheiro está no formato padrão do banco?")
 
     except Exception as e:
-        st.error(f"Erro no processamento: {e}")
+        st.error(f"Erro: {e}")
