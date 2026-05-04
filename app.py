@@ -8,7 +8,6 @@ import os
 # --- CONFIGURAÇÃO ---
 st.set_page_config(page_title="Budget Tracking S&G", layout="wide")
 
-# As tuas categorias reais (baseadas no teu Excel)
 MINHAS_CATEGORIAS = [
     "Cred. Hab. / Renda", "Combustível", "Roupa", "Mercearia", "Restaurantes", 
     "Água", "Prendas", "Saídas", "Netflix", "Internet", "Cabeleireiro", 
@@ -35,19 +34,14 @@ def sugerir_categoria_ia(descricao):
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
-        prompt = f"""
-        Categoriza este movimento bancário em Portugal: '{descricao}'
-        Usa apenas uma destas categorias: {MINHAS_CATEGORIAS}
-        Regras: 'PAG.PRESTACAO' ou 'EMPR' é 'Cred. Hab. / Renda'. 'PINGO DOCE' ou 'CONTINENTE' é 'Mercearia'.
-        Responde apenas a palavra exata.
-        """
+        prompt = f"Categoriza: '{descricao}'. Categorias: {MINHAS_CATEGORIAS}. Responde apenas a palavra exata."
         response = model.generate_content(prompt)
         sugestao = response.text.strip()
         return sugestao if sugestao in MINHAS_CATEGORIAS else "Outros"
     except: return "Outros"
 
 # --- INTERFACE ---
-st.title("📊 Budget Tracking Familiar S&G")
+st.title("📊 Budget Tracking S&G")
 
 dados_memoria = carregar_memoria()
 if "Dicionario" not in dados_memoria: dados_memoria["Dicionario"] = {}
@@ -56,50 +50,74 @@ uploaded_file = st.file_uploader("Upload do Extrato (Excel)", type="xlsx")
 
 if uploaded_file:
     try:
-        # Detetive de cabeçalho
-        df_raw = pd.read_excel(uploaded_file, header=None)
-        header_row = 0
-        for i, row in df_raw.iterrows():
-            row_str = " ".join([str(val).lower() for val in row.values if pd.notnull(val)])
-            if 'descrição' in row_str or 'descritivo' in row_str:
-                header_row = i
+        # 1. Encontrar a linha do cabeçalho
+        df_all = pd.read_excel(uploaded_file, header=None)
+        header_idx = 0
+        for i, row in df_all.iterrows():
+            row_str = " ".join([str(x).lower() for x in row if pd.notnull(x)])
+            if 'descri' in row_str or 'movimento' in row_str:
+                header_idx = i
                 break
         
-        df = pd.read_excel(uploaded_file, header=header_row)
+        # 2. Ler os dados reais
+        df = pd.read_excel(uploaded_file, header=header_idx)
         
-        # Mapeamento de colunas
-        mapping = {}
-        for c in df.columns:
-            c_l = str(c).lower()
-            if 'data mov' in c_l or ('data' in c_l and 'valor' not in c_l and 'Data' not in mapping.values()): mapping[c] = 'Data'
-            elif ('desc' in c_l or 'hist' in c_l) and 'Descricao' not in mapping.values(): mapping[c] = 'Descricao'
-            elif any(x in c_l for x in ['valor', 'import', 'montante']) and 'Valor' not in mapping.values(): mapping[c] = 'Valor'
+        # 3. Limpar colunas (remover as vazias que o Excel cria)
+        df = df.loc[:, ~df.columns.str.contains('^Unnamed')]
         
-        df = df.rename(columns=mapping)
-        df = df[['Data', 'Descricao', 'Valor']].copy()
+        # 4. Mapear colunas por ordem/nome de forma robusta
+        temp_df = pd.DataFrame()
+        
+        # Procurar Data
+        for col in df.columns:
+            if 'data' in str(col).lower() and 'valor' not in str(col).lower():
+                temp_df['Data'] = df[col]
+                break
+        
+        # Procurar Descrição
+        for col in df.columns:
+            if 'descri' in str(col).lower() or 'hist' in str(col).lower():
+                temp_df['Descricao'] = df[col]
+                break
+                
+        # Procurar Valor
+        for col in df.columns:
+            if any(x in str(col).lower() for x in ['valor', 'import', 'montante']) and 'data' not in str(col).lower():
+                temp_df['Valor'] = df[col]
+                break
+
+        # Se falhou a detecção automática, usa as primeiras 3 colunas como fallback
+        if len(temp_df.columns) < 3:
+            temp_df = df.iloc[:, [0, 1, 2]]
+            temp_df.columns = ['Data', 'Descricao', 'Valor']
+
+        df = temp_df.dropna(subset=['Descricao', 'Valor']).copy()
         df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
 
-        # Categorização com Memória + IA
+        # --- CATEGORIZAÇÃO ---
         cat_finais = []
         novos = []
-        for d in df['Descricao']:
+        # Criar dicionário local para evitar duplicados no loop
+        descricoes_unicas = df['Descricao'].unique()
+        map_sugestoes = {}
+
+        for d in descricoes_unicas:
             if d in dados_memoria["Dicionario"]:
-                cat_finais.append(dados_memoria["Dicionario"][d])
+                map_sugestoes[d] = dados_memoria["Dicionario"][d]
             else:
                 sug = sugerir_categoria_ia(d)
-                cat_finais.append(f"❓ {sug}")
-                if d not in novos: novos.append(d)
-        
-        df['Categoria'] = cat_finais
+                map_sugestoes[d] = f"❓ {sug}"
+                novos.append(d)
 
-        # Painel de Ensino (Onde tu dás a ordem final)
+        df['Categoria'] = df['Descricao'].map(map_sugestoes)
+
+        # --- PAINEL DE ENSINO ---
         if novos:
             with st.expander("🎓 Validar Novas Categorias", expanded=True):
                 for i, item in enumerate(novos[:15]):
                     c1, c2, c3 = st.columns([3, 2, 1])
-                    sug_ia = df[df['Descricao'] == item]['Categoria'].iloc[0].replace("❓ ", "")
-                    idx = MINHAS_CATEGORIAS.index(sug_ia) if sug_ia in MINHAS_CATEGORIAS else 0
-                    
+                    sug_limpa = map_sugestoes[item].replace("❓ ", "")
+                    idx = MINHAS_CATEGORIAS.index(sug_limpa) if sug_limpa in MINHAS_CATEGORIAS else 0
                     c1.write(f"**{item}**")
                     escolha = c2.selectbox(f"Cat", MINHAS_CATEGORIAS, index=idx, key=f"s_{i}", label_visibility="collapsed")
                     if c3.button("✓", key=f"b_{i}"):
@@ -107,17 +125,14 @@ if uploaded_file:
                         guardar_memoria(dados_memoria)
                         st.rerun()
 
-        # DASHBOARD
+        # --- DASHBOARD ---
         st.divider()
+        gastos = df[df['Valor'] < 0]
         c1, c2, c3 = st.columns(3)
-        gastos = df[df['Valor'] < 0]['Valor'].sum()
-        ganhos = df[df['Valor'] > 0]['Valor'].sum()
-        
-        c1.metric("Despesas", f"{abs(gastos):.2f}€")
-        c2.metric("Receitas", f"{ganhos:.2f}€")
+        c1.metric("Despesas", f"{abs(gastos['Valor'].sum()):.2f}€")
+        c2.metric("Receitas", f"{df[df['Valor'] > 0]['Valor'].sum():.2f}€")
         c3.metric("Saldo", f"{df['Valor'].sum():.2f}€")
 
-        # Gráfico de Barras (Mais profissional para muitas categorias)
         df_p = df.copy()
         df_p['Categoria'] = df_p['Categoria'].str.replace("❓ ", "")
         gastos_cat = df_p[df_p['Valor'] < 0].groupby('Categoria')['Valor'].sum().abs().reset_index().sort_values('Valor')
