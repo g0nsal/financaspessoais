@@ -5,7 +5,7 @@ import re
 
 st.set_page_config(page_title="S&G Budget Automator", layout="wide")
 
-# --- 1. TEU MOTOR DE REGRAS (Fórmulas do Google Sheets) ---
+# --- 1. TEU MOTOR DE REGRAS (O teu "REGEX" do Google Sheets) ---
 REGRAS_FIXAS = {
     "Portagens": r"VIAVERDE|A21|A8|A1|A2|A3|A4|A5|A6|A7|A9|A10",
     "Mercearia": r"CONTINENTE|LIDL|PINGO|MINIPRECO|ALDI",
@@ -37,76 +37,71 @@ def pedir_ia(descricao):
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         model = genai.GenerativeModel('gemini-1.5-flash-latest')
         categorias_lista = list(REGRAS_FIXAS.keys()) + ["Outros", "Pastelaria", "Saídas", "Roupa"]
-        prompt = f"Categoriza este gasto: '{descricao}'. Escolhe uma: {categorias_lista}. Responde apenas a categoria."
+        prompt = f"Categoriza este gasto: '{descricao}'. Escolhe uma destas categorias: {categorias_lista}. Responde apenas o nome da categoria."
         return model.generate_content(prompt).text.strip()
     except:
         return "Outros"
 
-# --- 2. INTERFACE ---
-st.title("📊 Automação S&G (Regras + SUMIF)")
+st.title("📊 Automação S&G (Versão ActivoBank)")
 
-uploaded_file = st.file_uploader("Carrega o extrato (Excel ou CSV)", type=["xlsx", "csv"])
+uploaded_file = st.file_uploader("Carrega o extrato Excel", type=["xlsx"])
 
 if uploaded_file:
     try:
-        # Leitura inicial
-        if uploaded_file.name.endswith('.xlsx'):
-            df_raw = pd.read_excel(uploaded_file, header=None)
-        else:
-            df_raw = pd.read_csv(uploaded_file, header=None)
-
-        # Encontrar cabeçalho
-        header_row = 0
+        # Lemos o Excel ignorando nomes de colunas, apenas os valores brutos
+        df_raw = pd.read_excel(uploaded_file, header=None)
+        
+        # 1. Procurar a linha onde os dados começam (contendo uma data ou palavra chave)
+        start_row = 0
         for i, row in df_raw.iterrows():
-            row_str = " ".join([str(val).lower() for val in row if pd.notnull(val)])
-            if any(x in row_str for x in ['descri', 'hist', 'movimento']):
-                header_row = i
+            row_str = " ".join([str(x).lower() for x in row if pd.notnull(x)])
+            if any(k in row_str for k in ['descri', 'hist', 'movimento', 'data']):
+                start_row = i + 1
                 break
         
-        # Recarregar com o cabeçalho certo
-        uploaded_file.seek(0)
-        if uploaded_file.name.endswith('.xlsx'):
-            df = pd.read_excel(uploaded_file, header=header_row)
-        else:
-            df = pd.read_csv(uploaded_file, header=header_row)
+        # Cortamos o "lixo" do topo
+        df = df_raw.iloc[start_row:].copy()
+        
+        # 2. MAPEAMENTO POR POSIÇÃO (Atalho para não falhar nomes)
+        # Normalmente: Col 0 = Data, Col 1 = Descrição, Col 2 ou 3 = Valor
+        df_clean = pd.DataFrame()
+        df_clean['Data'] = pd.to_datetime(df.iloc[:, 0], errors='coerce')
+        df_clean['Descricao'] = df.iloc[:, 1].astype(str)
+        
+        # O Valor pode estar na coluna 2 ou 3 (depende se há coluna de 'Data Valor')
+        # Vamos tentar converter ambas e ver qual tem números
+        v1 = pd.to_numeric(df.iloc[:, 2], errors='coerce')
+        v2 = pd.to_numeric(df.iloc[:, 3], errors='coerce')
+        df_clean['Valor'] = v1.fillna(v2).fillna(0)
 
-        # Mapear colunas
-        cols = {}
-        for c in df.columns:
-            cl = str(c).lower()
-            if ('data' in cl or 'mov' in cl) and 'valor' not in cl and 'Data' not in cols: cols['Data'] = c
-            if ('desc' in cl or 'hist' in cl) and 'Desc' not in cols: cols['Desc'] = c
-            if any(x in cl for x in ['valor', 'import', 'montant']) and 'Data' not in cl: cols['Valor'] = c
+        # Remover linhas sem data ou descrição válida
+        df_clean = df_clean.dropna(subset=['Data', 'Descricao'])
+        df_clean = df_clean[df_clean['Descricao'] != 'nan']
 
-        if len(cols) >= 3:
-            df = df[[cols['Data'], cols['Desc'], cols['Valor']]].copy()
-            df.columns = ['Data', 'Descricao', 'Valor']
-            df['Valor'] = pd.to_numeric(df['Valor'], errors='coerce').fillna(0)
-            df['Data'] = pd.to_datetime(df['Data'], errors='coerce')
+        # 3. CLASSIFICAÇÃO E SUMIF
+        df_clean['Categoria'] = df_clean['Descricao'].apply(lambda x: classificar_movimento(x) or pedir_ia(x))
+        
+        # Filtrar despesas (negativos) e agrupar
+        despesas = df_clean[df_clean['Valor'] < 0].copy()
+        despesas['Valor'] = despesas['Valor'].abs()
+        despesas['Mes_Ano'] = despesas['Data'].dt.strftime('%m-%Y')
+        
+        resumo = despesas.groupby(['Mes_Ano', 'Categoria'])['Valor'].sum().reset_index()
 
-            # 1. Classificar
-            df['Categoria'] = df['Descricao'].apply(lambda x: classificar_movimento(x) or pedir_ia(x))
-            
-            # 2. Agrupar (SUMIF) por Categoria e Mês
-            df_despesas = df[df['Valor'] < 0].copy()
-            df_despesas['Valor'] = df_despesas['Valor'].abs()
-            df_despesas['Mes_Ano'] = df_despesas['Data'].dt.strftime('%m-%Y')
-            
-            resumo = df_despesas.groupby(['Mes_Ano', 'Categoria'])['Valor'].sum().reset_index()
-
-            # 3. Gerar Output para copiar
-            st.subheader("📋 Dados Agrupados para o Excel")
-            output_text = ""
-            for _, row in resumo.iterrows():
-                # Formato: Data | Descrição | Valor | Categoria (separado por TAB)
-                data_excel = f"01-{row['Mes_Ano']}"
-                valor_pt = f"{row['Valor']:.2f}".replace('.', ',')
-                output_text += f"{data_excel}\tTotal {row['Categoria']}\t{valor_pt}\t{row['Categoria']}\n"
-            
-            st.text_area("Copia estas linhas e cola no Excel S&G:", value=output_text, height=250)
+        # 4. OUTPUT PARA O EXCEL
+        st.subheader("📋 Resumo por Categoria (Para colar no Excel S&G)")
+        output_text = ""
+        for _, row in resumo.iterrows():
+            data_formatada = f"01-{row['Mes_Ano']}"
+            valor_pt = f"{row['Valor']:.2f}".replace('.', ',')
+            # Formato: DATA [TAB] DESCRIÇÃO [TAB] VALOR [TAB] CATEGORIA
+            output_text += f"{data_formatada}\tTotal {row['Categoria']}\t{valor_pt}\t{row['Categoria']}\n"
+        
+        if output_text:
+            st.text_area("Copia tudo e cola no teu Excel:", value=output_text, height=300)
             st.dataframe(resumo)
         else:
-            st.error("Não detetei as colunas necessárias (Data, Descrição, Valor).")
-            
+            st.warning("Não foram detetadas despesas negativas no ficheiro.")
+
     except Exception as e:
-        st.error(f"Erro no processamento: {e}")
+        st.error(f"Erro ao processar: {e}")
