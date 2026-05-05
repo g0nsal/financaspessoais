@@ -1,64 +1,59 @@
 import streamlit as st
 import pandas as pd
 import google.generativeai as genai
-import sqlite3
+from streamlit_gsheets import GSheetsConnection
 import re
 
-# --- CONFIGURAÇÃO DA BASE DE DADOS ---
-conn = sqlite3.connect('financas.db', check_same_thread=False)
-c = conn.cursor()
-c.execute('''CREATE TABLE IF NOT EXISTS memoria 
-             (termo TEXT PRIMARY KEY, categoria TEXT)''')
-conn.commit()
+# --- CONFIGURAÇÃO DA APP ---
+st.set_page_config(page_title="S&G Budget AI", layout="wide")
 
-def aprender_regra(termo, categoria):
-    c.execute("INSERT OR REPLACE INTO memoria VALUES (?, ?)", (termo.upper(), categoria))
-    conn.commit()
+# Ligação à Google Sheet (Memória Permanente)
+conn = st.connection("gsheets", type=GSheetsConnection)
 
-def consultar_memoria(descricao):
-    c.execute("SELECT categoria FROM memoria")
-    regras = c.fetchall()
-    desc_upper = descricao.upper()
-    # Busca por termos aprendidos
-    c.execute("SELECT termo, categoria FROM memoria")
-    for termo, cat in c.fetchall():
-        if termo in desc_upper:
-            return cat
-    return None
+def carregar_memoria():
+    try:
+        return conn.read(worksheet="Memoria")
+    except:
+        return pd.DataFrame(columns=["Termo", "Categoria"])
 
-# --- ENGINE DE CATEGORIZAÇÃO ---
-def categorizar_inteligente(desc):
+def salvar_na_memoria(termo, categoria):
+    memoria_atual = carregar_memoria()
+    nova_regra = pd.DataFrame([{"Termo": termo.upper(), "Categoria": categoria}])
+    # Evitar duplicados e atualizar
+    updated_mem = pd.concat([memoria_atual[memoria_atual['Termo'] != termo.upper()], nova_regra])
+    conn.update(worksheet="Memoria", data=updated_mem)
+    st.toast(f"✅ Aprendido: {termo} é {categoria}")
+
+# --- MOTOR DE INTELIGÊNCIA ---
+def categorizar_inteligente(desc, categorias_disponiveis):
     desc_upper = str(desc).upper()
+    memoria = carregar_memoria()
     
-    # 1. Tenta Memória Permanente (O que tu já ensinaste)
-    memo = consultar_memoria(desc_upper)
-    if memo: return memo
-
-    # 2. IA Gemini com Prompt Reforçado
+    # 1. Procura na Memória (O que já ensinaste)
+    for _, row in memoria.iterrows():
+        if str(row['Termo']) in desc_upper:
+            return row['Categoria'], "Memória"
+            
+    # 2. IA Gemini (Especialista em Finanças)
     try:
         genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
         model = genai.GenerativeModel('gemini-1.5-flash')
-        prompt = f"""Age como contabilista. Categoriza este movimento bancário: "{desc}".
-        Categorias: {st.session_state.categorias_list}.
-        Dicas: VIAVERDE=Portagens, PINGO/CONTINENTE=Mercearia, REAL VIDA=Seguros, WOO=Telemóveis, MB WAY=Outros (ou Saídas se for restaurante).
-        Responde APENAS o nome da categoria."""
+        prompt = f"Categoriza: '{desc}'. Categorias: {categorias_disponiveis}. Responde apenas o nome da categoria."
         res = model.generate_content(prompt).text.strip()
-        return res if res in st.session_state.categorias_list else "Outros"
+        return res if res in categorias_disponiveis else "Outros", "IA"
     except:
-        return "Outros"
+        return "Outros", "Erro"
 
-# --- INTERFACE STREAMLIT ---
-st.set_page_config(page_title="S&G Budget Pro v5", layout="wide")
-if 'categorias_list' not in st.session_state:
-    st.session_state.categorias_list = ["Cred. Hab. / Renda", "Combustível", "Roupa", "Mercearia", "Restaurantes", "Água", "Seguros", "Farmácia", "Decoração/Obras", "Internet", "Telemóveis", "Portagens", "Gás", "Eletricidade", "Outros"]
+# --- INTERFACE ---
+st.title("📊 S&G Budget AI: O teu Gestor Autónomo")
 
-st.title("🧠 S&G Budget: Sistema com Memória Permanente")
+categorias = ["Cred. Hab. / Renda", "Combustível", "Roupa", "Mercearia", "Restaurantes", "Água", "Seguros", "Farmácia", "Decoração/Obras", "Internet", "Telemóveis", "Portagens", "Gás", "Eletricidade", "Outros"]
 
-file = st.file_uploader("Upload do Extrato", type="xlsx")
+file = st.file_uploader("Upload do Extrato Bancário", type="xlsx")
 
 if file:
+    # Lógica de leitura (ActivoBank)
     df_raw = pd.read_excel(file, header=None)
-    # (Lógica de detecção de linha inicial...)
     start_row = 0
     for i, row in df_raw.iterrows():
         if re.search(r'\d{2}-\d{2}-\d{4}', str(row[0])):
@@ -73,36 +68,46 @@ if file:
     df_proc['Valor'] = pd.to_numeric(df.iloc[:, v_col], errors='coerce').fillna(0)
     df_proc = df_proc.dropna(subset=['Data']).query("Valor != 0").copy()
 
-    # Processar
-    with st.spinner("A consultar memória e IA..."):
-        df_proc['Categoria'] = df_proc['Descricao'].apply(categorizar_inteligente)
+    # Processar com IA e Memória
+    with st.spinner("A organizar as tuas finanças..."):
+        resultados = [categorizar_inteligente(d, categorias) for d in df_proc['Descricao']]
+        df_proc['Categoria'] = [r[0] for r in resultados]
+        df_proc['Fonte'] = [r[1] for r in resultados]
 
-    # --- TABELA DE TREINO (OK/KO) ---
-    st.subheader("🎓 Ensina a tua IA (As tuas correções ficam gravadas para sempre)")
-    with st.expander("Clique para validar/corrigir movimentos individuais"):
+    # Interface de Validação (Onde tu ensinas a App)
+    st.subheader("🎓 Validação e Aprendizagem")
+    with st.form("validacao"):
+        novas_cats = []
         for i, row in df_proc.iterrows():
             col1, col2, col3 = st.columns([3, 2, 1])
-            col1.write(row['Descricao'])
-            nova_cat = col2.selectbox(f"Categoria {i}", st.session_state.categorias_list, 
-                                      index=st.session_state.categorias_list.index(row['Categoria']),
-                                      key=f"sel_{i}", label_visibility="collapsed")
-            if col3.button("Gravar", key=f"btn_{i}"):
-                # Limpa o nome para gravar regra (ex: tira números)
-                termo_limpo = re.sub(r'\d+', '', row['Descricao']).split('-')[0].strip()
-                aprender_regra(termo_limpo, nova_cat)
-                st.success(f"Aprendido: {termo_limpo}!")
+            col1.write(f"{row['Descricao']} ({row['Valor']:.2f}€)")
+            idx = categorias.index(row['Categoria']) if row['Categoria'] in categorias else 0
+            sel = col2.selectbox("Cat", categorias, index=idx, key=f"s_{i}", label_visibility="collapsed")
+            novas_cats.append(sel)
+            # Botão de ensinar dentro do form (ou gerido por lógica posterior)
+        
+        if st.form_submit_button("Confirmar Tudo e Gerar Relatório"):
+            for i, (orig, nova) in enumerate(zip(df_proc['Categoria'], novas_cats)):
+                if orig != nova or df_proc.iloc[i]['Fonte'] == "IA":
+                    termo = re.sub(r'\d+', '', df_proc.iloc[i]['Descricao']).split('-')[0].strip()
+                    salvar_na_memoria(termo, nova)
+            df_proc['Categoria'] = novas_cats
+            st.session_state.ready = True
+            st.session_state.df_ready = df_proc
 
-    # --- SUMIF FINAL ---
+if 'ready' in st.session_state:
+    # Relatório Final Somado (O teu Excel automático)
     st.divider()
-    despesas = df_proc[df_proc['Valor'] < 0].copy()
-    despesas['Valor'] = despesas['Valor'].abs()
-    resumo = despesas.groupby('Categoria')['Valor'].sum().reset_index()
+    resumo = st.session_state.df_ready[st.session_state.df_ready['Valor'] < 0].copy()
+    resumo['Valor'] = resumo['Valor'].abs()
+    final = resumo.groupby('Categoria')['Valor'].sum().reset_index()
     
+    st.subheader("📈 Resumo Mensal (Somas Automáticas)")
+    st.table(final)
+    
+    # Gerar texto para o teu Excel habitual (se ainda o quiseres usar)
     output = ""
-    mes_ano = df_proc['Data'].iloc[0].strftime('%m-%Y')
-    for _, r in resumo.iterrows():
+    for _, r in final.iterrows():
         val = f"{r['Valor']:.2f}".replace('.', ',')
-        output += f"01-{mes_ano}\tTotal {r['Categoria']}\t{val}\t{r['Categoria']}\n"
-    
-    st.subheader("📋 Output para o Excel S&G")
-    st.text_area("Copia para o Excel:", value=output, height=200)
+        output += f"01-Mês\tTotal {r['Categoria']}\t{val}\t{r['Categoria']}\n"
+    st.text_area("Copia para o teu Excel:", value=output)
