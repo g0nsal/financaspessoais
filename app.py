@@ -5,12 +5,12 @@ import re
 
 st.set_page_config(page_title="S&G Budget Automator", layout="wide")
 
-# --- 1. REGRAS DE OURO (IGUAL AO TEU EXCEL) ---
+# --- 1. TEU MOTOR DE REGRAS (Fórmulas do teu Sheets) ---
 REGRAS_FIXAS = {
     "Portagens": r"VIAVERDE|VIA VERDE|A21|A8|A1|A2|A3|A4|A5|A6|A7|A9|A10",
     "Mercearia": r"CONTINENTE|LIDL|PINGO|MINIPRECO|ALDI|AUCHAN|MERCADONA",
     "Água": r"SMAS|EPAL",
-    "Cred. Hab. / Renda": r"PRESTACAO|EMPRESTIMO|CHAB",
+    "Cred. Hab. / Renda": r"PRESTACAO|EMPRESTIMO|CHAB|RENDIMENTO MÍNIMO",
     "Despesas Médicas": r"MULTICARE|CUF|HOSPITAL|LUSIADAS",
     "Restaurantes": r"MR PIZZA|RESTAURANTE|UBER EATS|GLOVO",
     "Condomínio": r"VALOR ACTIVO|CONDOMINIO",
@@ -40,74 +40,86 @@ def pedir_ia(descricao):
         return model.generate_content(prompt).text.strip()
     except: return "Outros"
 
-st.title("📊 S&G Formatter v2.0")
+st.title("📊 S&G Formatter v3.0 (ActivoBank Fix)")
 
 uploaded_file = st.file_uploader("Carrega o Excel", type=["xlsx"])
 
 if uploaded_file:
     try:
-        # Lemos o Excel
+        # Lemos o Excel bruto para encontrar onde a tabela começa
         df_raw = pd.read_excel(uploaded_file, header=None)
         
-        # 1. Tentar encontrar a linha de cabeçalho real
-        header_row = 0
+        # 1. Encontrar a linha que contém os cabeçalhos reais (Data, Descrição, etc.)
+        start_row = 0
+        found_header = False
         for i, row in df_raw.iterrows():
-            row_str = " ".join([str(x).lower() for x in row if pd.notnull(x)])
-            if any(k in row_str for k in ['descri', 'hist', 'movimento', 'valor']):
-                header_row = i
+            # Juntamos o conteúdo da linha para procurar palavras-chave
+            line_content = " ".join([str(x).lower() for x in row if pd.notnull(x)])
+            if any(k in line_content for k in ['data', 'descritivo', 'descri', 'movimento', 'valor', 'montante']):
+                start_row = i
+                found_header = True
                 break
         
-        # Recarregar com o cabeçalho detetado
-        df = pd.read_excel(uploaded_file, header=header_row)
-        st.write("🔍 Colunas detetadas:", list(df.columns))
-
-        # 2. Mapeamento Inteligente
-        col_data, col_desc, col_valor = None, None, None
-        
-        for col in df.columns:
-            c_low = str(col).lower()
-            if ('data' in c_low or 'mov' in c_low) and 'valor' not in c_low: col_data = col
-            if 'desc' in c_low or 'hist' in c_low or 'texto' in c_low: col_desc = col
-            if any(x in c_low for x in ['valor', 'import', 'montant', 'débito', 'debito']): col_valor = col
-
-        # Fallback se falhar mapeamento por nome
-        if not col_data: col_data = df.columns[0]
-        if not col_desc: col_desc = df.columns[1]
-        if not col_valor: col_valor = df.columns[2] if len(df.columns) > 2 else df.columns[-1]
-
-        # 3. Processamento
-        df_clean = pd.DataFrame()
-        df_clean['Data'] = pd.to_datetime(df[col_data], errors='coerce')
-        df_clean['Descricao'] = df[col_desc].astype(str)
-        df_clean['Valor'] = pd.to_numeric(df[col_valor], errors='coerce').fillna(0)
-        
-        df_clean = df_clean.dropna(subset=['Data']).copy()
-        
-        # Aplicar Regras + IA
-        df_clean['Categoria'] = df_clean['Descricao'].apply(lambda x: classificar_movimento(x) or pedir_ia(x))
-        
-        # 4. Agrupar por Categoria e Mês
-        # Filtramos despesas (tudo o que for negativo ou, se for tudo positivo, assumimos despesa)
-        despesas = df_clean[df_clean['Valor'] != 0].copy()
-        despesas['Valor'] = despesas['Valor'].abs()
-        despesas['Mes_Ano'] = despesas['Data'].dt.strftime('%m-%Y')
-        
-        resumo = despesas.groupby(['Mes_Ano', 'Categoria'])['Valor'].sum().reset_index()
-
-        # 5. Output Formatado
-        st.subheader("📋 Output para o Excel S&G")
-        output_text = ""
-        for _, row in resumo.iterrows():
-            data_out = f"01-{row['Mes_Ano']}"
-            valor_out = f"{row['Valor']:.2f}".replace('.', ',')
-            output_text += f"{data_out}\tTotal {row['Categoria']}\t{valor_out}\t{row['Categoria']}\n"
-        
-        if output_text:
-            st.text_area("Copia e cola no Excel S&G:", value=output_text, height=350)
-            st.write("### Detalhe das somas:")
-            st.dataframe(resumo)
+        if not found_header:
+            st.error("Não consegui encontrar a tabela de movimentos. O ficheiro está correto?")
         else:
-            st.warning("Não foram processados dados. Verifica se as colunas estão corretas acima.")
+            # Recarregamos o DF a partir da linha certa
+            df = pd.read_excel(uploaded_file, header=start_row)
+            st.write("✅ Tabela encontrada! Colunas:", list(df.columns))
+
+            # 2. Mapeamento Inteligente (Ajustado para ActivoBank)
+            col_data, col_desc, col_valor = None, None, None
+            for col in df.columns:
+                c_low = str(col).lower()
+                if 'data' in c_low and 'valor' not in c_low: col_data = col
+                if any(x in c_low for x in ['descri', 'hist', 'texto', 'detalhe']): col_desc = col
+                if any(x in c_low for x in ['montante', 'valor', 'quantia', 'import', 'débito', 'debito']): col_valor = col
+
+            # Se falhar, tentamos por posição (mais comum no AB: Data=0, Desc=1, Valor=3 ou 4)
+            if not col_data: col_data = df.columns[0]
+            if not col_desc: col_desc = df.columns[1]
+            if not col_valor:
+                # No AB o valor costuma estar na 4ª ou 5ª coluna se houver "Data Valor"
+                for i in [3, 4, 2]:
+                    if i < len(df.columns):
+                        col_valor = df.columns[i]
+                        break
+
+            # 3. Limpeza e Processamento
+            df_clean = pd.DataFrame()
+            df_clean['Data'] = pd.to_datetime(df[col_data], errors='coerce')
+            df_clean['Descricao'] = df[col_desc].astype(str)
+            df_clean['Valor'] = pd.to_numeric(df[col_valor], errors='coerce').fillna(0)
+            
+            # Remover linhas inúteis (saldos, rodapés ou datas vazias)
+            df_clean = df_clean.dropna(subset=['Data']).copy()
+            df_clean = df_clean[df_clean['Descricao'].str.len() > 3]
+
+            # 4. Classificar e Agrupar
+            df_clean['Categoria'] = df_clean['Descricao'].apply(lambda x: classificar_movimento(x) or pedir_ia(x))
+            
+            # Focar apenas em despesas (valores negativos ou considerar tudo despesa se vierem positivos)
+            # Dica: No ActivoBank as despesas vêm com sinal negativo.
+            despesas = df_clean[df_clean['Valor'] < 0].copy()
+            despesas['Valor'] = despesas['Valor'].abs()
+            despesas['Mes_Ano'] = despesas['Data'].dt.strftime('%m-%Y')
+            
+            resumo = despesas.groupby(['Mes_Ano', 'Categoria'])['Valor'].sum().reset_index()
+
+            # 5. Output Final para o teu Excel
+            st.subheader("📋 Copiar para Excel S&G")
+            output_rows = []
+            for _, row in resumo.iterrows():
+                data_excel = f"01-{row['Mes_Ano']}"
+                valor_pt = f"{row['Valor']:.2f}".replace('.', ',')
+                # DATA [TAB] DESCRIÇÃO [TAB] VALOR [TAB] CATEGORIA
+                output_rows.append(f"{data_excel}\tTotal {row['Categoria']}\t{valor_pt}\t{row['Categoria']}")
+            
+            if output_rows:
+                st.text_area("Seleciona tudo, copia e cola no Excel:", value="\n".join(output_rows), height=300)
+                st.dataframe(resumo)
+            else:
+                st.warning("Não encontrei despesas negativas. Tens a certeza que este extrato tem gastos?")
 
     except Exception as e:
-        st.error(f"Erro: {e}")
+        st.error(f"Erro Crítico: {e}")
