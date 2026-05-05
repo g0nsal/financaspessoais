@@ -3,39 +3,11 @@ import pandas as pd
 import google.generativeai as genai
 import re
 import json
-import os
 
-st.set_page_config(page_title="S&G Budget AI Learner", layout="wide")
+# --- CONFIGURAÇÃO ---
+st.set_page_config(page_title="S&G Budget Pro", layout="wide")
 
-# --- 1. REGRAS DE OURO E MEMÓRIA ---
-MEMORIA_FILE = "memoria_ia.json"
-
-def carregar_memoria():
-    if os.path.exists(MEMORIA_FILE):
-        try:
-            with open(MEMORIA_FILE, "r") as f: return json.load(f)
-        except: return {}
-    return {}
-
-def salvar_memoria(termo, categoria):
-    memoria = carregar_memoria()
-    memoria[termo.upper()] = categoria
-    with open(MEMORIA_FILE, "w") as f:
-        json.dump(memoria, f)
-
-# Tuas regras prioritárias
-REGRAS_FIXAS = {
-    "Portagens": r"VIAVERDE|VIA VERDE|A21|A8|A1|A2|A3|A4|A5|A6|A7|A9|A10",
-    "Mercearia": r"CONTINENTE|LIDL|PINGO|MINIPRECO|ALDI|AUCHAN|MODELO",
-    "Água": r"SMAS|EPAL",
-    "Cred. Hab. / Renda": r"PRESTACAO|EMPRESTIMO|CHAB|PAG.PREST",
-    "Despesas Médicas": r"MULTICARE|CUF|HOSPITAL|LUSIADAS|SAUDE",
-    "Farmácia": r"FARMACIA|FARMÁCIA|FARMA|WELLS|WELL S",
-    "Seguros": r"REAL VIDA|OCIDENTAL|FIDELIDADE|REALVSEGUROS",
-    "Combustível": r"AUCHAN ENERGY|SODIMAFRA|PRIO|REPSOL|BP|GALP"
-}
-
-CATEGORIAS_S_G = [
+CATEGORIAS = [
     "Cred. Hab. / Renda", "Combustível", "Roupa", "Mercearia", "Restaurantes", 
     "Água", "Prendas", "Saídas", "Netflix", "Internet", "Cabeleireiro", 
     "Seguros", "Despesas Médicas", "Farmácia", "Decoração/Obras", 
@@ -44,86 +16,98 @@ CATEGORIAS_S_G = [
     "Investimentos", "Telemóveis", "Pastelaria", "Salário", "Outros"
 ]
 
-def motor_decisao(descricao):
-    desc_upper = str(descricao).upper()
-    # 1. Regras Fixas
-    for cat, pattern in REGRAS_FIXAS.items():
-        if re.search(pattern, desc_upper): return cat, "Regra Fixa"
-    # 2. Memória
-    memoria = carregar_memoria()
-    for termo, cat in memoria.items():
-        if termo in desc_upper: return cat, "Aprendido"
-    return None, "IA"
+# --- MOTOR DE INTELIGÊNCIA ---
+def limpar_texto(txt):
+    """Remove ruído bancário: números, terminais, locais repetitivos"""
+    txt = str(txt).upper()
+    txt = re.sub(r'\d+', '', txt) # Remove números
+    txt = re.sub(r'COMPRA|PAGAMENTO|PAG\.|CONTACTLESS|MAFRA|LISBOA|PORTUGAL', '', txt)
+    return txt.strip()
 
-# --- 2. INTERFACE ---
-st.title("🧠 S&G Budget AI: Automação e Somatórios")
+def categorizar_pro(descricao):
+    # 1. Regras Rápidas (Hardcoded para performance)
+    desc_clean = limpar_texto(descricao)
+    
+    # Teu REGEX direto
+    if any(x in desc_clean for x in ["VIAVERDE", "VIA VERDE", "A1", "A8", "A2"]): return "Portagens"
+    if any(x in desc_clean for x in ["PINGO", "CONTINENTE", "LIDL", "AUCHAN", "ALDI"]): return "Mercearia"
+    if "WELLS" in desc_clean or "FARMACIA" in desc_clean: return "Farmácia"
+    if "PRESTACAO" in desc_clean: return "Cred. Hab. / Renda"
+    if "SMAS" in desc_clean: return "Água"
 
-uploaded_file = st.file_uploader("Upload Excel ActivoBank", type=["xlsx"])
-
-if uploaded_file:
+    # 2. IA com Contexto de Especialista
     try:
-        df_raw = pd.read_excel(uploaded_file, header=None)
-        start_row = 0
-        for i, row in df_raw.iterrows():
-            if re.search(r'\d{2}-\d{2}-\d{4}', str(row[0])):
-                start_row = i
-                break
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])
+        model = genai.GenerativeModel('gemini-1.5-flash')
         
-        df = df_raw.iloc[start_row:].copy()
-        df_proc = pd.DataFrame()
-        df_proc['Data'] = pd.to_datetime(df.iloc[:, 0], dayfirst=True, errors='coerce')
-        df_proc['Descricao'] = df.iloc[:, 2].astype(str)
-        v_col = 3 if pd.to_numeric(df.iloc[:, 3], errors='coerce').notnull().sum() > 0 else 4
-        df_proc['Valor'] = pd.to_numeric(df.iloc[:, v_col], errors='coerce').fillna(0)
-        df_proc = df_proc.dropna(subset=['Data']).query("Valor != 0").copy()
+        prompt = f"""
+        Age como um contabilista pessoal em Portugal. 
+        Analisa este movimento: "{descricao}" (Limpo: "{desc_clean}")
+        
+        Usa EXCLUSIVAMENTE uma destas categorias: {CATEGORIAS}
+        
+        Raciocínio:
+        - "Cáritas" ou "Donativo" -> Caridade
+        - "Vinted" ou "Zippy" -> Roupa
+        - "Netflix", "Spotify", "Disney" -> Netflix
+        - "Uber Eats" ou "Restaurante" -> Restaurantes
+        
+        Responde apenas o nome da categoria.
+        """
+        response = model.generate_content(prompt)
+        res = response.text.strip()
+        # Validação: se a IA inventar uma categoria, vai para Outros
+        return res if res in CATEGORIAS else "Outros"
+    except:
+        return "Outros"
 
-        if 'df_final' not in st.session_state or st.session_state.get('last_file') != uploaded_file.name:
-            with st.spinner("A aplicar regras e somatórios..."):
-                cats, fontes = [], []
-                for desc in df_proc['Descricao']:
-                    res, fonte = motor_decisao(desc)
-                    cats.append(res if res else "Outros") # Fallback para Outros se a IA não correu
-                    fontes.append(fonte)
-                
-                df_proc['Categoria'] = cats
-                df_proc['Fonte'] = fontes
-                st.session_state.df_final = df_proc.reset_index(drop=True)
-                st.session_state.last_file = uploaded_file.name
+# --- INTERFACE ---
+st.title("📑 S&G Budget Automator Pro")
 
-        # --- OUTPUT PARA EXCEL (O SUMIF que faltava) ---
-        st.subheader("📋 Output para o Excel S&G (Somado)")
-        
-        # Filtrar apenas despesas negativas para o somatório
-        df_despesas = st.session_state.df_final[st.session_state.df_final['Valor'] < 0].copy()
-        df_despesas['Valor'] = df_despesas['Valor'].abs()
-        
-        # Agrupar por Categoria (O teu SUMIF automático)
-        resumo_mensal = df_despesas.groupby('Categoria')['Valor'].sum().reset_index()
-        
-        output_txt = ""
-        data_str = st.session_state.df_final['Data'].iloc[0].strftime('%m-%Y')
-        for _, r in resumo_mensal.iterrows():
-            # Data | Descrição Fixa | Valor Somado | Categoria
-            valor_pt = f"{r['Valor']:.2f}".replace('.', ',')
-            output_txt += f"01-{data_str}\tTotal {r['Categoria']}\t{valor_pt}\t{r['Categoria']}\n"
-        
-        st.text_area("Copia para o Excel (Resumo Mensal):", value=output_txt, height=200)
+file = st.file_uploader("Upload do Extrato (ActivoBank)", type="xlsx")
 
-        # --- RELATÓRIO DE CONFERÊNCIA ---
-        st.divider()
-        st.subheader("🔍 Conferir Movimentos Individuais")
-        with st.form("form_ajustes"):
-            for i, row in st.session_state.df_final.iterrows():
-                col1, col2 = st.columns([3, 1])
-                idx_cat = CATEGORIAS_S_G.index(row['Categoria']) if row['Categoria'] in CATEGORIAS_S_G else 0
-                nova = col1.selectbox(f"{row['Descricao']} ({row['Valor']:.2f}€)", CATEGORIAS_S_G, index=idx_cat, key=f"s_{i}")
-                # Se mudares, marcamos para aprender
-                if col2.checkbox("Ensinar IA", key=f"c_{i}"):
-                    termo = re.sub(r'\d+', '', row['Descricao']).split('-')[0].strip()
-                    salvar_memoria(termo, nova)
-            
-            if st.form_submit_button("Recalcular Somatórios"):
-                st.rerun()
+if file:
+    # Leitura ignorando o lixo do topo (procura a linha com datas)
+    df_raw = pd.read_excel(file, header=None)
+    start_row = 0
+    for i, row in df_raw.iterrows():
+        if re.search(r'\d{2}-\d{2}-\d{4}', str(row[0])):
+            start_row = i
+            break
+    
+    df = pd.read_excel(file, skiprows=start_row)
+    
+    # Mapeamento por posição (ActivoBank: A=Data, C=Desc, D ou E=Valor)
+    df_proc = pd.DataFrame()
+    df_proc['Data'] = pd.to_datetime(df.iloc[:, 0], dayfirst=True, errors='coerce')
+    df_proc['Descricao'] = df.iloc[:, 2].astype(str)
+    
+    # Tenta achar a coluna do dinheiro
+    v_col = 3 if pd.to_numeric(df.iloc[:, 3], errors='coerce').notnull().sum() > 5 else 4
+    df_proc['Valor'] = pd.to_numeric(df.iloc[:, v_col], errors='coerce').fillna(0)
+    
+    # Limpeza e Categorização
+    df_proc = df_proc.dropna(subset=['Data']).query("Valor != 0").copy()
+    
+    with st.spinner("IA a analisar com precisão..."):
+        df_proc['Categoria'] = df_proc['Descricao'].apply(categorizar_pro)
 
-    except Exception as e:
-        st.error(f"Erro: {e}")
+    # --- RELATÓRIO SUMIF ---
+    st.subheader("📊 Resumo para o Excel S&G")
+    
+    despesas = df_proc[df_proc['Valor'] < 0].copy()
+    despesas['Valor'] = despesas['Valor'].abs()
+    
+    # Agrupamento (O SUMIF que tu queres)
+    resumo = despesas.groupby('Categoria')['Valor'].sum().reset_index()
+    
+    output = ""
+    data_ref = df_proc['Data'].iloc[0].strftime('%m-%Y')
+    for _, r in resumo.iterrows():
+        val = f"{r['Valor']:.2f}".replace('.', ',')
+        output += f"01-{data_ref}\tTotal {r['Categoria']}\t{val}\t{r['Categoria']}\n"
+    
+    st.text_area("Copia para a aba 'Expenses':", value=output, height=250)
+    
+    with st.expander("Ver conferência detalhada"):
+        st.dataframe(df_proc)
